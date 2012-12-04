@@ -487,7 +487,7 @@ static int bs_pstor_open(struct scsi_lu *lu, char *path, int *fd,
 			 uint64_t *size)
 {
 	blkptr_t nrblks = 0;
-	init_device(O_RDWR | O_LARGEFILE | lu->bsoflags);
+	init_device(O_RDWR | O_LARGEFILE | O_DIRECT | lu->bsoflags);
 	fprintf(stderr, "setting up %s\n", path);
 	if (dev_open(CACHE_DEV_PATH, CACHE_DEV) != DEV_READY
 	    || dev_open(path, PRI_DEV) != DEV_READY) {
