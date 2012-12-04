@@ -502,7 +502,7 @@ static int bs_pstor_open(struct scsi_lu *lu, char *path, int *fd,
 	bitmap = bitmap_new(nrblks);
 	clean_btree = btree_mem_new();
 	dirty_btree = btree_mem_new();
-	sync_thread_info_init(&info, 64, 128);
+	sync_thread_info_init(&info, 4096, 8192);
 	dprintf("creating cache object\n");
 	cache = cache_new(nrblks, clean_btree, dirty_btree, bitmap, &info,
 			  CACHE_DEV, PRI_DEV);
