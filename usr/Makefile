@@ -50,7 +50,7 @@ TGTD_DEP = $(TGTD_OBJS:.o=.d)
 all: $(PROGRAMS)
 
 tgtd: $(TGTD_OBJS)
-	$(CC) $^ -o $@ $(LIBS)
+	$(CC) $^ -o $@ $(LIBS) -lpst -L../..
 
 -include $(TGTD_DEP)
 
