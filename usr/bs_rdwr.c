@@ -64,14 +64,8 @@ static void bs_sync_sync_range(struct scsi_cmd *cmd, uint32_t length,
 		set_medium_error(result, key, asc);
 }
 
-static struct cache *cache;
-static struct btree *clean_btree, *dirty_btree;
-static struct bitmap *bitmap;
-struct sync_thread_info info;
-
-#define PRI_DEV 1
-#define CACHE_DEV 2
-#define CACHE_DEV_PATH "/dev/sdb"
+enum cache_setup_mode __mode;
+struct cache* __cache;
 
 static inline int check_alignment(uint64_t length, uint64_t offset)
 {
@@ -91,6 +85,7 @@ static int bs_pstor_pread(int fd, void *buffer, uint64_t length,
 	unsigned char *ptr = base_ptr;
 	void *extra_buffer = NULL;
 	blkptr_t blknr = offset;
+	struct cache *cache = __cache;
 
 	if (fd != dev_getfd(cache->primary_dev_id))
 		return pread64(fd, buffer, length, offset);
@@ -109,11 +104,17 @@ static int bs_pstor_pread(int fd, void *buffer, uint64_t length,
 		if (rem != 0 || rem_length < BLK_SIZE) {
 			blknr -= rem;
 			extra_buffer = buffer_alloc();
-			cache_pstor_read(cache, extra_buffer, blknr);
+			if (__mode == NO_CACHE)
+				dev_read(PRI_DEV_ID, blknr, extra_buffer);
+			else
+				cache_pstor_read(cache, extra_buffer, blknr);
 			memcpy(ptr, extra_buffer + rem, rem_length);
 			buffer_free(extra_buffer);
 		} else {
-			cache_pstor_read(cache, ptr, blknr);
+			if (__mode == NO_CACHE)
+				dev_read(PRI_DEV_ID, blknr, ptr);
+			else
+				cache_pstor_read(cache, ptr, blknr);
 		}
 		ptr += rem_length;
 		blknr += BLK_SIZE;
@@ -126,8 +127,11 @@ static int bs_pstor_pwrite(int fd, const void *buffer, uint64_t length,
 			   uint64_t offset)
 {
 	const unsigned char *base_ptr = buffer;
+        const unsigned char *end_ptr = base_ptr + length;
 	const unsigned char *ptr = base_ptr;
+        void *extra_buffer = NULL;
 	blkptr_t blknr = offset;
+	struct cache *cache = __cache;
 
 	if (fd != dev_getfd(cache->primary_dev_id))
 		return pwrite64(fd, buffer, length, offset);
@@ -135,12 +139,36 @@ static int bs_pstor_pwrite(int fd, const void *buffer, uint64_t length,
 	if (!check_alignment(length, offset))
 		return -1;
 
-	while (ptr < base_ptr + length) {
-		cache_pstor_write(cache, ptr, blknr);
-		ptr += BLK_SIZE;
+	while (ptr < end_ptr) {
+		blkptr_t rem = blknr % BLK_SIZE;
+		uint64_t rem_length = BLK_SIZE - rem;
+
+		if (length < rem_length) {
+			rem_length = length;
+		}
+
+		if (rem != 0 || rem_length < BLK_SIZE) {
+			blknr -= rem;
+			extra_buffer = buffer_alloc();
+			cache_pstor_read(cache, extra_buffer, blknr);
+			memcpy(extra_buffer + rem, buffer, rem_length);
+			if (__mode == NO_CACHE)
+				dev_write(PRI_DEV_ID, blknr, extra_buffer);
+			else
+				cache_pstor_write(cache, extra_buffer, blknr,
+						  __mode);
+			buffer_free(extra_buffer);
+		} else {
+			if (__mode == NO_CACHE)
+				dev_write(PRI_DEV_ID, blknr, ptr);
+			else
+				cache_pstor_write(cache, ptr, blknr, __mode);
+		}
+		ptr += rem_length;
 		blknr += BLK_SIZE;
+		length -= rem_length;
 	}
-	return length;
+	return ptr - base_ptr;
 }
 
 static void bs_rdwr_request(struct scsi_cmd *cmd)
@@ -243,15 +271,21 @@ static void bs_rdwr_request(struct scsi_cmd *cmd)
 	case SYNCHRONIZE_CACHE:
 	case SYNCHRONIZE_CACHE_16:
 		/* TODO */
-		dprintf("SYNC\n");
 		length = (cmd->scb[0] == SYNCHRONIZE_CACHE) ? 0 : 0;
 
 		if (cmd->scb[1] & 0x2) {
 			result = SAM_STAT_CHECK_CONDITION;
 			key = ILLEGAL_REQUEST;
 			asc = ASC_INVALID_FIELD_IN_CDB;
-		} else
-			bs_sync_sync_range(cmd, length, &result, &key, &asc);
+		} else {
+			fprintf(stderr, "SYNC CACHE\n");
+			if (__mode == NO_CACHE || __cache == NULL
+			    || dev_getfd(__cache->primary_dev_id) != fd) {
+				bs_sync_sync_range(cmd, length, &result, &key, &asc);
+			} else {
+				cache_pstor_sync(__cache, __mode);
+			}
+		}
 		break;
 	case WRITE_VERIFY:
 	case WRITE_VERIFY_12:
@@ -486,32 +520,18 @@ static void bs_rdwr_close(struct scsi_lu *lu)
 static int bs_pstor_open(struct scsi_lu *lu, char *path, int *fd,
 			 uint64_t *size)
 {
-	blkptr_t nrblks = 0;
-	init_device(O_RDWR | O_LARGEFILE | O_DIRECT | lu->bsoflags);
-	fprintf(stderr, "setting up %s\n", path);
-	if (dev_open(CACHE_DEV_PATH, CACHE_DEV) != DEV_READY
-	    || dev_open(path, PRI_DEV) != DEV_READY) {
-		perror("open");
-		return -1;
-	}
-	*size = dev_total_size(PRI_DEV);
-	nrblks = *size / BLK_SIZE;
+	// init_device(O_RDWR | O_LARGEFILE | lu->bsoflags);
+        __mode = cache_conf_get_setup();
+        __cache = cache_conf_create(lu->bsoflags, __mode);
 
-	/* setup the cache object */
-	dprintf("device size %llu\n", *size);
-	bitmap = bitmap_new(nrblks);
-	clean_btree = btree_mem_new();
-	dirty_btree = btree_mem_new();
-	sync_thread_info_init(&info, 4096, 8192);
-	dprintf("creating cache object\n");
-	cache = cache_new(nrblks, clean_btree, dirty_btree, bitmap, &info,
-			  CACHE_DEV, PRI_DEV);
-	sync_thread_start_worker(&info);
-
+	*size = dev_total_size(PRI_DEV_ID);
 	if (*size == 0) {
 		return -1;
 	}
-	*fd = dev_getfd(PRI_DEV);
+
+        /* setup the cache object */
+	dprintf("device size %llu\n", *size);
+	*fd = dev_getfd(PRI_DEV_ID);
 	if (!lu->attrs.no_auto_lbppbe)
 		update_lbppbe(lu, BLK_SIZE); // set to 4K all the time
 	return 0;
@@ -519,8 +539,8 @@ static int bs_pstor_open(struct scsi_lu *lu, char *path, int *fd,
 
 static void bs_pstor_close(struct scsi_lu *lu)
 {
-	dev_close(PRI_DEV);
-	dev_close(CACHE_DEV);
+	dev_close(PRI_DEV_ID);
+	dev_close(CACHE_DEV_ID);
 }
 
 int nr_iothreads = 16;
